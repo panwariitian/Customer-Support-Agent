@@ -1,0 +1,73 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # lets the job ask Azure for a short-lived token (OIDC), no stored passwords
+  contents: read
+
+env:
+  RESOURCE_GROUP: rg-panwariitian-4668
+  ACR_NAME: panwariacr46062
+  CONTAINER_APP: support-api
+  API_URL: https://support-api.mangobeach-27868ea4.eastus2.azurecontainerapps.io
+  # Public identifiers, not secrets: they ship inside the browser bundle anyway.
+  VITE_ENTRA_TENANT_ID: 802bd5e7-0a7c-49cd-8c01-6b4d14c51c4d
+  VITE_ENTRA_FRONTEND_CLIENT_ID: 03f6e9d8-1873-4fb7-8ae2-32827e645631
+  VITE_ENTRA_BACKEND_CLIENT_ID: 8fc92533-6bbb-4db0-b8e1-b8c2368244a8
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in Azure Container Registry
+        run: az acr build -r "$ACR_NAME" -t "support-api:${{ github.sha }}" --platform linux/amd64 backend
+
+      - name: Roll out new revision (keeps existing env vars and secrets)
+        run: |
+          az containerapp update -g "$RESOURCE_GROUP" -n "$CONTAINER_APP" \
+            --image "$ACR_NAME.azurecr.io/support-api:${{ github.sha }}"
+
+      - name: Health check
+        run: |
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$API_URL/health" || true)
+            echo "health: $code"; [ "$code" = "200" ] && exit 0; sleep 10
+          done
+          exit 1
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ env.API_URL }}
+
+      - name: Deploy to Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.SWA_DEPLOYMENT_TOKEN }}
+          action: upload
+          app_location: dist
+          skip_app_build: true
